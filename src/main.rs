@@ -1,3 +1,6 @@
+mod onnx;
+mod tensor;
+
 fn main() {
-    println!("Hello, world!");
+    onnx::parse("models/mnist-12.onnx").unwrap();
 }
