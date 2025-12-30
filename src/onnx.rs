@@ -1,6 +1,7 @@
 use crate::{
-    onnx::proto::ValueInfoProto,
-    tensor::{self, Tensor},
+    onnx::proto::{NodeProto, ValueInfoProto},
+    ops::{self, InferShape},
+    tensor::{self, IntoTensor, Tensor},
 };
 use prost::Message;
 use std::{collections::HashMap, error::Error, fs};
@@ -31,7 +32,7 @@ pub fn parse_tensor(tensor: proto::type_proto::Tensor) -> Result<Tensor, Box<dyn
 
             match d.value {
                 Some(Value::DimValue(v)) => v as usize,
-                _ => panic!("Invalid dimensions for tensor."),
+                _ => panic!("Invalid dimensions for tensor, symbolic dimensions not supported."),
             }
         })
         .collect();
@@ -68,6 +69,228 @@ fn parse_tensors<T: Iterator<Item = ValueInfoProto>>(
     Ok(())
 }
 
+fn retrieve_tens<'a>(
+    buffer: &'a [Tensor],
+    m: &HashMap<String, usize>,
+    name: &String,
+) -> Result<&'a Tensor, Box<dyn Error>> {
+    let buf_idx = *m
+        .get(name)
+        .ok_or_else(|| format!("Failed to retrieve tensor {} while parsing", name))?;
+    return Ok(&buffer[buf_idx]);
+}
+
+fn push_tens(buffer: &mut Vec<Tensor>, m: &mut HashMap<String, usize>, name: String, tens: Tensor) {
+    m.insert(name, buffer.len());
+    buffer.push(tens);
+}
+
+struct NodeAttributes {
+    pub dilations: [usize; 2],
+    pub strides: [usize; 2],
+    pub group: usize,
+    pub pads: [usize; 4],
+    pub kernel_shape: [usize; 2],
+    pub pad_type: ops::AutoPadType,
+}
+
+fn parse_attrs(attributes: Vec<proto::AttributeProto>) -> NodeAttributes {
+    let mut dilations = [1usize; 2];
+    let mut strides = [1usize; 2];
+    let mut group = 1usize;
+    let mut pads = [0usize; 4];
+    let mut pad_type = ops::AutoPadType::NotSet;
+    let mut kernel_shape = [1usize; 2];
+
+    for attr in attributes {
+        match attr.name.as_str() {
+            "dilations" => dilations = [attr.ints[0] as usize, attr.ints[1] as usize],
+            "strides" => strides = [attr.ints[0] as usize, attr.ints[1] as usize],
+            "group" => group = attr.i as usize,
+            "auto_pad" => {
+                let val = str::from_utf8(attr.s.as_slice())
+                    .expect("auto_pad attr should be valid UTF-8.");
+
+                pad_type = match val {
+                    "SAME_UPPER" => ops::AutoPadType::SameUpper,
+                    "SAME_LOWER" => ops::AutoPadType::SameLower,
+                    "NOTSET" => ops::AutoPadType::NotSet,
+                    _ => panic!("{} pad type not implemented.", val),
+                };
+            }
+            "pads" => {
+                pads = [
+                    attr.ints[0] as usize,
+                    attr.ints[1] as usize,
+                    attr.ints[2] as usize,
+                    attr.ints[3] as usize,
+                ]
+            }
+            "kernel_shape" => {
+                kernel_shape = [attr.ints[0] as usize, attr.ints[1] as usize];
+            }
+            _ => continue,
+        }
+    }
+
+    NodeAttributes {
+        dilations,
+        strides,
+        group,
+        pads,
+        kernel_shape,
+        pad_type,
+    }
+}
+
+fn parse_node(
+    node: NodeProto,
+    buffer: &mut Vec<Tensor>,
+    m: &mut HashMap<String, usize>,
+) -> Result<(), Box<dyn Error>> {
+    let mut input_shapes = Vec::<&[usize]>::new();
+
+    for inp in &node.input {
+        let buf_idx = *m.get(inp).ok_or(format!(
+            "Input {} not found. Are you sure this graph was topologically sorted?",
+            inp
+        ))?;
+
+        input_shapes.push(&buffer[buf_idx].shape());
+    }
+
+    let attrs = parse_attrs(node.attribute);
+
+    match node.op_type.as_str() {
+        "Conv" => {
+            let shape = match attrs.pad_type {
+                ops::AutoPadType::NotSet => {
+                    let cd = ops::ConvData {
+                        pads: attrs.pads,
+                        strides: attrs.strides,
+                        dilations: attrs.dilations,
+                        group: attrs.group,
+                    };
+
+                    cd.infer_shape(input_shapes[0..2].try_into()?)
+                }
+                // TODO(satvik): Extract this into a seperate method
+                _ => vec![
+                    input_shapes[0][0],
+                    input_shapes[1][0],
+                    input_shapes[0][2].div_ceil(attrs.strides[0]),
+                    input_shapes[0][3].div_ceil(attrs.strides[1]),
+                ],
+            };
+
+            // TODO(satvik): Make this handle multiple types of convolutions
+            let tens = Tensor::zeros::<f32>(shape);
+            push_tens(
+                buffer,
+                m,
+                node.output
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "Require at least on output for Conv")?,
+                tens,
+            );
+        }
+
+        "Add" => {
+            let shape = ops::Op::Add.infer_shape(input_shapes[0..2].try_into()?);
+
+            let tens = Tensor::zeros::<f32>(shape);
+            push_tens(
+                buffer,
+                m,
+                node.output.into_iter().next().ok_or_else(|| panic!())?,
+                tens,
+            );
+        }
+
+        "Relu" => {
+            // TODO(satvik): Verify this actually works
+            // Because we're going to do the ReLU in-place, we just point output to input.
+            let buf_idx = *m.get(&node.input[0]).ok_or(format!(
+                "Failed to retrieve tensor {} while parsing",
+                node.input[0]
+            ))?;
+
+            m.insert(
+                node.output.into_iter().next().ok_or_else(|| panic!())?,
+                buf_idx,
+            );
+        }
+
+        "MaxPool" => {
+            let input = input_shapes[0];
+
+            // TODO(satvik): Extract this into a seperate function
+            let shape = match attrs.pad_type {
+                ops::AutoPadType::SameLower | ops::AutoPadType::SameUpper => vec![
+                    input[0],
+                    input[1],
+                    input[2].div_ceil(attrs.strides[0]),
+                    input[3].div_ceil(attrs.strides[1]),
+                ],
+                _ => {
+                    let mpd = ops::MaxPoolData {
+                        pads: attrs.pads,
+                        strides: attrs.strides,
+                        dilations: attrs.dilations,
+                        kernel_shape: attrs.kernel_shape,
+                    };
+
+                    mpd.infer_shape(&[input])
+                }
+            };
+
+            let tens = Tensor::zeros::<f32>(shape);
+
+            match node.output.len() {
+                1usize => push_tens(
+                    buffer,
+                    m,
+                    node.output.into_iter().next().ok_or_else(|| panic!())?,
+                    tens,
+                ),
+                2usize => todo!(),
+                _ => panic!("MaxPool operator has a maximum of 2 outputs (and a minimum of 1)."),
+            };
+        }
+
+        "Reshape" => {
+            // TODO: Verify if this logic works, but I think here we can
+            // retain the tensor in memory and simply "reshape" when the node is executed
+            //
+            // TODO(satvik): We're going to have to split shape inference and allocation into
+            // seperate passes in the future here to reduce memory overhead.
+
+            // Lookup for value of the reshape
+            let new_shape_tens = retrieve_tens(buffer, m, &node.input[1])?;
+            let new_shape: &[i64] = new_shape_tens
+                .data()
+                .ok_or("Require input index 1 of Reshape to be a new shape.")?;
+
+            let tens = Tensor::zeros::<f32>(new_shape.into_iter().map(|i| *i as usize).collect());
+
+            push_tens(
+                buffer,
+                m,
+                node.output
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| format!("Required at least one output for Reshape"))?,
+                tens,
+            );
+        }
+
+        op => unimplemented!("Operator {} not implemented yet.", op),
+    }
+
+    Ok(())
+}
+
 pub fn parse(path: &str) -> Result<(), Box<dyn Error>> {
     let bytes = fs::read(path)?;
     let proto = proto::ModelProto::decode(bytes.as_slice())?;
@@ -93,13 +316,7 @@ pub fn parse(path: &str) -> Result<(), Box<dyn Error>> {
 
     // Parse nodes
     for n in g.node {
-        for tens in n.input.into_iter().chain(n.output.into_iter()) {
-            tens_to_buffer.entry(tens).or_insert_with(|| {
-                // Will need to infer the shape of this tensor. Since
-                // this is topologically sorted, input tensors are already present.
-                todo!()
-            });
-        }
+        parse_node(n, &mut buffers, &mut tens_to_buffer)?;
     }
 
     println!("{:#?}", tens_to_buffer);
@@ -114,8 +331,6 @@ fn parse_tensor_proto(
 ) -> Result<(), Box<dyn Error>> {
     use proto::tensor_proto::DataType;
     use std::convert::TryFrom;
-
-    println!("| Found {} with shape {:?}", t.name, t.dims);
 
     let dt = DataType::try_from(t.data_type)?;
     let shape = t.dims.into_iter().map(|d| d as usize).collect();
@@ -133,6 +348,6 @@ fn parse_tensor_proto(
         }
     };
 
-    buffer.push(tens); 
+    buffer.push(tens);
     Ok(())
 }

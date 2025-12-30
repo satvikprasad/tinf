@@ -3,8 +3,9 @@ use std::ops::Add;
 #[derive(Clone, Debug)]
 pub struct TensorData<T: Copy + Default + Add<Output = T>> {
     data: Vec<T>,
-    shape: Vec<usize>,
     strides: Vec<usize>,
+
+    pub shape: Vec<usize>,
 }
 
 fn compute_strides(shape: &[usize]) -> Vec<usize> {
@@ -51,8 +52,11 @@ pub enum Tensor {
 impl Tensor {
     pub fn new<T: IntoTensor>(data: Vec<T>, shape: Vec<usize>) -> Self {
         // Assert that data is large enough
-        assert_eq!(data.len(), shape.iter().product());
         T::into_tensor(data, shape)
+    }
+
+    pub fn data<T: IntoTensor>(&self) -> Option<&[T]> {
+        T::try_get_data(self)
     }
 
     pub fn splat<T: IntoTensor + Clone>(val: T, shape: Vec<usize>) -> Self {
@@ -63,10 +67,21 @@ impl Tensor {
     pub fn zeros<T: IntoTensor + Clone + Default>(shape: Vec<usize>) -> Self {
         Self::splat::<T>(Default::default(), shape)
     }
+
+    pub fn shape(&self) -> &[usize] {
+        match self {
+            Tensor::F32(t) => &t.shape,
+            Tensor::I64(t) => &t.shape,
+        }
+    }
 }
 
 pub trait IntoTensor {
     fn into_tensor(data: Vec<Self>, shape: Vec<usize>) -> Tensor
+    where
+        Self: Sized;
+
+    fn try_get_data(tens: &Tensor) -> Option<&[Self]>
     where
         Self: Sized;
 }
@@ -76,7 +91,18 @@ macro_rules! impl_into_tensor {
         impl IntoTensor for $t {
             fn into_tensor(data: Vec<Self>, shape: Vec<usize>) -> Tensor {
                 let strides = compute_strides(&shape);
-                Tensor::$variant(TensorData { data, shape, strides })
+                Tensor::$variant(TensorData {
+                    data,
+                    shape,
+                    strides,
+                })
+            }
+
+            fn try_get_data(tens: &Tensor) -> Option<&[Self]> {
+                match tens {
+                    Tensor::$variant(t) => Some(t.data.as_slice()),
+                    _ => None,
+                }
             }
         }
     };
@@ -84,4 +110,3 @@ macro_rules! impl_into_tensor {
 
 impl_into_tensor!(f32, F32);
 impl_into_tensor!(i64, I64);
-
