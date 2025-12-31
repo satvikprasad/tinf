@@ -144,6 +144,7 @@ pub enum Op {
     Conv(ConvData),
     Add,
     MaxPool(MaxPoolData),
+    MatMul
 }
 
 impl InferShape for Op {
@@ -158,9 +159,9 @@ impl InferShape for Op {
                 let max_rank = a.len().max(b.len());
                 let mut shape = vec![0usize; max_rank];
 
-                let mut i = (a.len() - 1) as i32;
-                let mut j = (b.len() - 1) as i32;
-                let mut k = (max_rank - 1) as i32;
+                let mut i = a.len() as i32 - 1;
+                let mut j = b.len() as i32 - 1;
+                let mut k = max_rank as i32 - 1;
 
                 while i >= 0 || j >= 0 {
                     if i < 0 {
@@ -186,6 +187,50 @@ impl InferShape for Op {
 
                 shape
             }
+            Op::MatMul => {
+                let a = &inputs[0];
+                let b = &inputs[1];
+
+                let max_rank = a.len().max(b.len());
+                let mut shape = vec![0usize; max_rank];
+
+                assert_eq!(a[a.len() - 1], b[b.len() - 2]);
+
+                if a.len() < 2 || b.len() < 2 {
+                    todo!("1D matmul not implemented yet.");
+                }
+
+                shape[max_rank - 1] = b[b.len() - 1];
+                shape[max_rank - 2] = a[a.len() - 2];
+
+                let mut i = a.len() as i32 - 3;
+                let mut j = b.len() as i32 - 3;
+                let mut k = max_rank as i32 - 3;
+
+                while i >= 0 || j >= 0 {
+                    if i < 0 {
+                        shape[k as usize] = b[j as usize];
+                        j -= 1;
+                        k -= 1;
+                        continue;
+                    }
+
+                    if j < 0 {
+                        shape[k as usize] = a[i as usize];
+                        i -= 1;
+                        k -= 1;
+                        continue;
+                    }
+
+                    shape[k as usize] = a[i as usize].max(b[j as usize]);
+
+                    i -= 1;
+                    j -= 1;
+                    k -= 1;
+                }
+
+                shape
+            },
         }
     }
 }

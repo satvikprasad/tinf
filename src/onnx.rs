@@ -43,8 +43,9 @@ pub fn parse_tensor(tensor: proto::type_proto::Tensor) -> Result<Tensor, Box<dyn
     }
 }
 
-fn parse_tensors<T: Iterator<Item = ValueInfoProto>>(
+fn parse_io_tensors<T: Iterator<Item = ValueInfoProto>>(
     tensors: T,
+    shapes: &mut HashMap<String, Vec<usize>>,
     buffer: &mut Vec<Tensor>,
     m: &mut HashMap<String, usize>,
 ) -> Result<(), Box<dyn Error>> {
@@ -59,7 +60,9 @@ fn parse_tensors<T: Iterator<Item = ValueInfoProto>>(
         match val {
             Value::TensorType(tensor) => {
                 let tens = parse_tensor(tensor)?;
-                m.insert(inp.name, buffer.len());
+                m.insert(inp.name.clone(), buffer.len());
+                shapes.insert(inp.name, Vec::from(tens.shape())); // TODO(satvik): Don't
+                // make this a copy
                 buffer.push(tens);
             }
             _ => todo!(),
@@ -143,20 +146,21 @@ fn parse_attrs(attributes: Vec<proto::AttributeProto>) -> NodeAttributes {
     }
 }
 
-fn parse_node(
+fn parse_tensor_shapes(
     node: NodeProto,
-    buffer: &mut Vec<Tensor>,
-    m: &mut HashMap<String, usize>,
+    shapes: &mut HashMap<String, Vec<usize>>,
+    buffer: &Vec<Tensor>, // Required for initializer lookups,
+    tensors: &HashMap<String, usize>,
 ) -> Result<(), Box<dyn Error>> {
     let mut input_shapes = Vec::<&[usize]>::new();
 
     for inp in &node.input {
-        let buf_idx = *m.get(inp).ok_or(format!(
+        let shape = shapes.get(inp).ok_or(format!(
             "Input {} not found. Are you sure this graph was topologically sorted?",
             inp
         ))?;
 
-        input_shapes.push(&buffer[buf_idx].shape());
+        input_shapes.push(shape.as_slice());
     }
 
     let attrs = parse_attrs(node.attribute);
@@ -183,42 +187,33 @@ fn parse_node(
                 ],
             };
 
-            // TODO(satvik): Make this handle multiple types of convolutions
-            let tens = Tensor::zeros::<f32>(shape);
-            push_tens(
-                buffer,
-                m,
+            shapes.insert(
                 node.output
                     .into_iter()
                     .next()
                     .ok_or_else(|| "Require at least on output for Conv")?,
-                tens,
+                shape,
             );
         }
 
         "Add" => {
             let shape = ops::Op::Add.infer_shape(input_shapes[0..2].try_into()?);
 
-            let tens = Tensor::zeros::<f32>(shape);
-            push_tens(
-                buffer,
-                m,
+            shapes.insert(
                 node.output.into_iter().next().ok_or_else(|| panic!())?,
-                tens,
+                shape,
             );
         }
 
         "Relu" => {
             // TODO(satvik): Verify this actually works
             // Because we're going to do the ReLU in-place, we just point output to input.
-            let buf_idx = *m.get(&node.input[0]).ok_or(format!(
-                "Failed to retrieve tensor {} while parsing",
-                node.input[0]
-            ))?;
+            let in_shape = shapes.get(&node.input[0]).ok_or("Required input for ReLU")?.clone();
 
-            m.insert(
+            shapes.insert(
                 node.output.into_iter().next().ok_or_else(|| panic!())?,
-                buf_idx,
+                in_shape, // TODO: Here we can reuse the original vec rather than
+                                            // construct a new one from this slice
             );
         }
 
@@ -245,14 +240,10 @@ fn parse_node(
                 }
             };
 
-            let tens = Tensor::zeros::<f32>(shape);
-
             match node.output.len() {
-                1usize => push_tens(
-                    buffer,
-                    m,
+                1usize => shapes.insert(
                     node.output.into_iter().next().ok_or_else(|| panic!())?,
-                    tens,
+                    shape,
                 ),
                 2usize => todo!(),
                 _ => panic!("MaxPool operator has a maximum of 2 outputs (and a minimum of 1)."),
@@ -267,21 +258,29 @@ fn parse_node(
             // seperate passes in the future here to reduce memory overhead.
 
             // Lookup for value of the reshape
-            let new_shape_tens = retrieve_tens(buffer, m, &node.input[1])?;
+            let new_shape_tens = retrieve_tens(buffer, tensors, &node.input[1])?;
             let new_shape: &[i64] = new_shape_tens
                 .data()
                 .ok_or("Require input index 1 of Reshape to be a new shape.")?;
 
-            let tens = Tensor::zeros::<f32>(new_shape.into_iter().map(|i| *i as usize).collect());
-
-            push_tens(
-                buffer,
-                m,
+            shapes.insert(
                 node.output
                     .into_iter()
                     .next()
                     .ok_or_else(|| format!("Required at least one output for Reshape"))?,
-                tens,
+                new_shape.into_iter().map(|i| *i as usize).collect(),
+            );
+        }
+
+        "MatMul" => {
+            let shape = ops::Op::MatMul.infer_shape(input_shapes.as_slice());
+
+            shapes.insert(
+                node.output
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| format!("Require at least one output for MatMul"))?,
+                shape,
             );
         }
 
@@ -298,34 +297,35 @@ pub fn parse(path: &str) -> Result<(), Box<dyn Error>> {
     let g = proto.graph.ok_or("Model did not contain a graph.")?;
 
     let mut buffers = Vec::<Tensor>::new();
-    let mut tens_to_buffer = HashMap::<String, usize>::new();
+    let mut tens_to_buffer = HashMap::<String, usize>::with_capacity(g.node.len() + g.input.len() + g.output.len());
+    let mut shapes = HashMap::<String, Vec<usize>>::with_capacity(g.node.len() + g.input.len() + g.output.len());
 
     // Parse input/output tensors
-    parse_tensors(
+    parse_io_tensors(
         g.input.into_iter().chain(g.output.into_iter()),
+        &mut shapes,
         &mut buffers,
         &mut tens_to_buffer,
     )?;
 
-    println!("Parsing initializers...");
-
     // Parse protos for initializers
     for initializer in g.initializer {
-        parse_tensor_proto(initializer, &mut buffers, &mut tens_to_buffer)?;
+        parse_initializer(initializer, &mut shapes, &mut buffers, &mut tens_to_buffer)?;
     }
 
-    // Parse nodes
+    // Shape inference
     for n in g.node {
-        parse_node(n, &mut buffers, &mut tens_to_buffer)?;
+        parse_tensor_shapes(n, &mut shapes, &mut buffers, &mut tens_to_buffer)?;
     }
 
-    println!("{:#?}", tens_to_buffer);
+    println!("{:#?}", shapes);
 
     Ok(())
 }
 
-fn parse_tensor_proto(
+fn parse_initializer(
     t: proto::TensorProto,
+    shapes: &mut HashMap<String, Vec<usize>>,
     buffer: &mut Vec<Tensor>,
     m: &mut HashMap<String, usize>,
 ) -> Result<(), Box<dyn Error>> {
@@ -333,11 +333,13 @@ fn parse_tensor_proto(
     use std::convert::TryFrom;
 
     let dt = DataType::try_from(t.data_type)?;
-    let shape = t.dims.into_iter().map(|d| d as usize).collect();
+    let shape: Vec<usize> = t.dims.into_iter().map(|d| d as usize).collect();
 
     // We're guaranteed to have never encountered this tensor before,
     // initializers are unique.
-    m.insert(t.name, buffer.len());
+    m.insert(t.name.clone(), buffer.len());
+
+    shapes.insert(t.name, shape.clone()); // TODO(satvik): Think about erasing this clone
 
     let tens = match dt {
         DataType::Float => Tensor::new(t.float_data, shape),
