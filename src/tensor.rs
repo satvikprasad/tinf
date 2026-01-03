@@ -2,7 +2,7 @@ use std::ops::Add;
 
 #[derive(Clone, Debug)]
 pub struct TensorData<T: Copy + Default + Add<Output = T>> {
-    data: Vec<T>,
+    pub data: Vec<T>,
     strides: Vec<usize>,
 
     pub shape: Vec<usize>,

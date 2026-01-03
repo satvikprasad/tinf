@@ -1,13 +1,14 @@
 use crate::tensor::Tensor;
 
 pub trait InferShape {
-    fn infer_shape(&self, inputs: &[&[usize]]) -> Vec<usize>; // TODO(satvik): Maybe make user allocate this vector
+    fn infer_shape(&self, inputs: &[&[usize]], output: &mut Vec<usize>); // TODO(satvik): Maybe make user allocate this vector
 }
 
 pub trait Execute {
     fn execute(&self, inputs: &[&Tensor], output: &mut Tensor);
 }
 
+#[derive(Debug)]
 pub enum AutoPadType {
     SameUpper,
     SameLower,
@@ -20,30 +21,51 @@ pub struct ConvData {
     pub strides: [usize; 2],
     pub dilations: [usize; 2],
     pub group: usize,
+    pub pad_type: AutoPadType,
 }
 
 impl InferShape for ConvData {
-    fn infer_shape(&self, inputs: &[&[usize]]) -> Vec<usize> {
+    fn infer_shape(&self, inputs: &[&[usize]], output: &mut Vec<usize>) {
         let input_dim = inputs[0]; // [N, C, H, W]
         let kernel_dim = inputs[1]; // [O, I, H, W]
-        //
+
         debug_assert_eq!(
             input_dim[1],
             kernel_dim[1] * self.group,
             "Input channels must match kernel channels * groups"
         );
 
-        let effective_dim = [
-            self.dilations[0] * (kernel_dim[2] - 1) + 1,
-            self.dilations[1] * (kernel_dim[3] - 1) + 1,
-        ];
+        match self.pad_type {
+            AutoPadType::NotSet => {
+                let effective_dim = [
+                    self.dilations[0] * (kernel_dim[2] - 1) + 1,
+                    self.dilations[1] * (kernel_dim[3] - 1) + 1,
+                ];
 
-        let out_h =
-            (input_dim[2] + self.pads[0] + self.pads[2] - effective_dim[0]) / self.strides[0] + 1;
-        let out_w =
-            (input_dim[3] + self.pads[1] + self.pads[3] - effective_dim[1]) / self.strides[1] + 1;
+                let out_h = (input_dim[2] + self.pads[0] + self.pads[2] - effective_dim[0])
+                    / self.strides[0]
+                    + 1;
+                let out_w = (input_dim[3] + self.pads[1] + self.pads[3] - effective_dim[1])
+                    / self.strides[1]
+                    + 1;
 
-        vec![input_dim[0], kernel_dim[0], out_h, out_w]
+                output.resize(4, 0);
+
+                output[0] = input_dim[0];
+                output[1] = kernel_dim[0];
+                output[2] = out_h;
+                output[3] = out_w;
+            }
+
+            _ => {
+                output.resize(4, 0);
+
+                output[0] = input_dim[0];
+                output[1] = kernel_dim[0];
+                output[2] = input_dim[2].div_ceil(self.strides[0]);
+                output[3] = input_dim[3].div_ceil(self.strides[1]);
+            }
+        }
     }
 }
 
@@ -118,24 +140,54 @@ pub struct MaxPoolData {
     pub pads: [usize; 4],
     pub strides: [usize; 2],
     pub dilations: [usize; 2],
-    pub kernel_shape: [usize; 2]
+    pub kernel_shape: [usize; 2],
+    pub pad_type: AutoPadType,
 }
 
 impl InferShape for MaxPoolData {
-    fn infer_shape(&self, inputs: &[&[usize]]) -> Vec<usize> {
+    fn infer_shape(&self, inputs: &[&[usize]], output: &mut Vec<usize>) {
+        output.resize(4, 0);
         let input_dim = inputs[0]; // [N, C, H, W]
 
-        let effective_dim = [
-            self.dilations[0] * (self.kernel_shape[0] - 1) + 1,
-            self.dilations[1] * (self.kernel_shape[1] - 1) + 1,
-        ];
+        match self.pad_type {
+            AutoPadType::NotSet => {
+                let effective_dim = [
+                    self.dilations[0] * (self.kernel_shape[0] - 1) + 1,
+                    self.dilations[1] * (self.kernel_shape[1] - 1) + 1,
+                ];
 
-        let out_h =
-            (input_dim[2] + self.pads[0] + self.pads[2] - effective_dim[0]) / self.strides[0] + 1;
-        let out_w =
-            (input_dim[3] + self.pads[1] + self.pads[3] - effective_dim[1]) / self.strides[1] + 1;
+                let out_h = (input_dim[2] + self.pads[0] + self.pads[2] - effective_dim[0])
+                    / self.strides[0]
+                    + 1;
+                let out_w = (input_dim[3] + self.pads[1] + self.pads[3] - effective_dim[1])
+                    / self.strides[1]
+                    + 1;
 
-        vec![input_dim[0], input_dim[1], out_h, out_w]
+                output[0] = input_dim[0];
+                output[1] = input_dim[1];
+                output[2] = out_h;
+                output[3] = out_w;
+            }
+            _ => {
+                output[0] = input_dim[0];
+                output[1] = input_dim[1];
+                output[2] = input_dim[2].div_ceil(self.strides[0]);
+                output[3] = input_dim[3].div_ceil(self.strides[1]);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ReshapeData {
+    pub output_shape: Vec<usize>,
+}
+
+impl InferShape for ReshapeData {
+    fn infer_shape(&self, _: &[&[usize]], output: &mut Vec<usize>) {
+        output.resize(self.output_shape.len(), 0);
+
+        output.clone_from(&self.output_shape);
     }
 }
 
@@ -144,20 +196,23 @@ pub enum Op {
     Conv(ConvData),
     Add,
     MaxPool(MaxPoolData),
-    MatMul
+    MatMul,
+    Reshape(ReshapeData),
+    ReLU,
 }
 
 impl InferShape for Op {
-    fn infer_shape(&self, inputs: &[&[usize]]) -> Vec<usize> {
+    fn infer_shape(&self, inputs: &[&[usize]], output: &mut Vec<usize>) {
         match self {
-            Op::Conv(cd) => cd.infer_shape(inputs),
-            Op::MaxPool(mpd) => mpd.infer_shape(inputs),
+            Op::Conv(cd) => cd.infer_shape(inputs, output),
+            Op::MaxPool(mpd) => mpd.infer_shape(inputs, output),
             Op::Add => {
                 let a = &inputs[0];
                 let b = &inputs[1];
 
                 let max_rank = a.len().max(b.len());
-                let mut shape = vec![0usize; max_rank];
+
+                output.resize(max_rank, 0);
 
                 let mut i = a.len() as i32 - 1;
                 let mut j = b.len() as i32 - 1;
@@ -165,34 +220,32 @@ impl InferShape for Op {
 
                 while i >= 0 || j >= 0 {
                     if i < 0 {
-                        shape[k as usize] = b[j as usize];
+                        output[k as usize] = b[j as usize];
                         j -= 1;
                         k -= 1;
                         continue;
                     }
 
                     if j < 0 {
-                        shape[k as usize] = a[i as usize];
+                        output[k as usize] = a[i as usize];
                         i -= 1;
                         k -= 1;
                         continue;
                     }
 
-                    shape[k as usize] = a[i as usize].max(b[j as usize]);
+                    output[k as usize] = a[i as usize].max(b[j as usize]);
 
                     i -= 1;
                     j -= 1;
                     k -= 1;
                 }
-
-                shape
             }
             Op::MatMul => {
                 let a = &inputs[0];
                 let b = &inputs[1];
 
                 let max_rank = a.len().max(b.len());
-                let mut shape = vec![0usize; max_rank];
+                output.resize(max_rank, 0);
 
                 assert_eq!(a[a.len() - 1], b[b.len() - 2]);
 
@@ -200,8 +253,8 @@ impl InferShape for Op {
                     todo!("1D matmul not implemented yet.");
                 }
 
-                shape[max_rank - 1] = b[b.len() - 1];
-                shape[max_rank - 2] = a[a.len() - 2];
+                output[max_rank - 1] = b[b.len() - 1];
+                output[max_rank - 2] = a[a.len() - 2];
 
                 let mut i = a.len() as i32 - 3;
                 let mut j = b.len() as i32 - 3;
@@ -209,28 +262,34 @@ impl InferShape for Op {
 
                 while i >= 0 || j >= 0 {
                     if i < 0 {
-                        shape[k as usize] = b[j as usize];
+                        output[k as usize] = b[j as usize];
                         j -= 1;
                         k -= 1;
                         continue;
                     }
 
                     if j < 0 {
-                        shape[k as usize] = a[i as usize];
+                        output[k as usize] = a[i as usize];
                         i -= 1;
                         k -= 1;
                         continue;
                     }
 
-                    shape[k as usize] = a[i as usize].max(b[j as usize]);
+                    output[k as usize] = a[i as usize].max(b[j as usize]);
 
                     i -= 1;
                     j -= 1;
                     k -= 1;
                 }
+            }
+            Op::Reshape(rd) => {
+                rd.infer_shape(inputs, output);
+            }
+            Op::ReLU => {
+                output.resize(inputs[0].len(), 0);
 
-                shape
-            },
-        }
+                output.clone_from_slice(inputs[0]);
+            }
+        };
     }
 }
