@@ -1,7 +1,7 @@
-use crate::tensor::Tensor;
+use crate::tensor::{Tensor, TensorShape};
 
 pub trait InferShape {
-    fn infer_shape(&self, inputs: &[&[usize]], output: &mut Vec<usize>); // TODO(satvik): Maybe make user allocate this vector
+    fn infer_shape(&self, inputs: &[TensorShape], output: &mut TensorShape); // TODO(satvik): Maybe make user allocate this vector
 }
 
 pub trait Execute {
@@ -25,7 +25,7 @@ pub struct ConvData {
 }
 
 impl InferShape for ConvData {
-    fn infer_shape(&self, inputs: &[&[usize]], output: &mut Vec<usize>) {
+    fn infer_shape(&self, inputs: &[TensorShape], output: &mut TensorShape) {
         let input_dim = inputs[0]; // [N, C, H, W]
         let kernel_dim = inputs[1]; // [O, I, H, W]
 
@@ -49,8 +49,6 @@ impl InferShape for ConvData {
                     / self.strides[1]
                     + 1;
 
-                output.resize(4, 0);
-
                 output[0] = input_dim[0];
                 output[1] = kernel_dim[0];
                 output[2] = out_h;
@@ -58,8 +56,6 @@ impl InferShape for ConvData {
             }
 
             _ => {
-                output.resize(4, 0);
-
                 output[0] = input_dim[0];
                 output[1] = kernel_dim[0];
                 output[2] = input_dim[2].div_ceil(self.strides[0]);
@@ -71,7 +67,7 @@ impl InferShape for ConvData {
 
 impl ConvData {
     pub fn compute_autopad(
-        inputs: &[&[usize]],
+        inputs: &[TensorShape],
         dilations: &[usize; 2],
         strides: &[usize; 2],
         out_pads: &mut [usize; 4],
@@ -145,8 +141,7 @@ pub struct MaxPoolData {
 }
 
 impl InferShape for MaxPoolData {
-    fn infer_shape(&self, inputs: &[&[usize]], output: &mut Vec<usize>) {
-        output.resize(4, 0);
+    fn infer_shape(&self, inputs: &[TensorShape], output: &mut TensorShape) {
         let input_dim = inputs[0]; // [N, C, H, W]
 
         match self.pad_type {
@@ -180,13 +175,11 @@ impl InferShape for MaxPoolData {
 
 #[derive(Debug)]
 pub struct ReshapeData {
-    pub output_shape: Vec<usize>,
+    pub output_shape: TensorShape,
 }
 
 impl InferShape for ReshapeData {
-    fn infer_shape(&self, _: &[&[usize]], output: &mut Vec<usize>) {
-        output.resize(self.output_shape.len(), 0);
-
+    fn infer_shape(&self, _: &[TensorShape], output: &mut TensorShape) {
         output.clone_from(&self.output_shape);
     }
 }
@@ -202,93 +195,40 @@ pub enum Op {
 }
 
 impl InferShape for Op {
-    fn infer_shape(&self, inputs: &[&[usize]], output: &mut Vec<usize>) {
+    fn infer_shape(&self, inputs: &[TensorShape], output: &mut TensorShape) {
         match self {
             Op::Conv(cd) => cd.infer_shape(inputs, output),
             Op::MaxPool(mpd) => mpd.infer_shape(inputs, output),
             Op::Add => {
-                let a = &inputs[0];
-                let b = &inputs[1];
+                // TODO(satvik): Broadcasting validation.
+                use crate::tensor;
 
-                let max_rank = a.len().max(b.len());
+                let a = inputs[0];
+                let b = inputs[1];
 
-                output.resize(max_rank, 0);
-
-                let mut i = a.len() as i32 - 1;
-                let mut j = b.len() as i32 - 1;
-                let mut k = max_rank as i32 - 1;
-
-                while i >= 0 || j >= 0 {
-                    if i < 0 {
-                        output[k as usize] = b[j as usize];
-                        j -= 1;
-                        k -= 1;
-                        continue;
-                    }
-
-                    if j < 0 {
-                        output[k as usize] = a[i as usize];
-                        i -= 1;
-                        k -= 1;
-                        continue;
-                    }
-
-                    output[k as usize] = a[i as usize].max(b[j as usize]);
-
-                    i -= 1;
-                    j -= 1;
-                    k -= 1;
+                for i in 0..tensor::MAX_RANK {
+                    output[i] = a[i].max(b[i]);
                 }
             }
             Op::MatMul => {
-                let a = &inputs[0];
-                let b = &inputs[1];
+                // TODO(satvik): Broadcasting validation.
+                use crate::tensor;
 
-                let max_rank = a.len().max(b.len());
-                output.resize(max_rank, 0);
+                let a = inputs[0];
+                let b = inputs[1];
 
-                assert_eq!(a[a.len() - 1], b[b.len() - 2]);
+                assert_eq!(a[tensor::MAX_RANK - 1], b[tensor::MAX_RANK - 2]);
 
-                if a.len() < 2 || b.len() < 2 {
-                    todo!("1D matmul not implemented yet.");
-                }
+                output[tensor::MAX_RANK - 1] = b[tensor::MAX_RANK - 1];
+                output[tensor::MAX_RANK - 2] = a[tensor::MAX_RANK - 2];
 
-                output[max_rank - 1] = b[b.len() - 1];
-                output[max_rank - 2] = a[a.len() - 2];
-
-                let mut i = a.len() as i32 - 3;
-                let mut j = b.len() as i32 - 3;
-                let mut k = max_rank as i32 - 3;
-
-                while i >= 0 || j >= 0 {
-                    if i < 0 {
-                        output[k as usize] = b[j as usize];
-                        j -= 1;
-                        k -= 1;
-                        continue;
-                    }
-
-                    if j < 0 {
-                        output[k as usize] = a[i as usize];
-                        i -= 1;
-                        k -= 1;
-                        continue;
-                    }
-
-                    output[k as usize] = a[i as usize].max(b[j as usize]);
-
-                    i -= 1;
-                    j -= 1;
-                    k -= 1;
+                for i in 0..tensor::MAX_RANK - 2 {
+                    output[i] = a[i].max(b[i]);
                 }
             }
-            Op::Reshape(rd) => {
-                rd.infer_shape(inputs, output);
-            }
+            Op::Reshape(rd) => rd.infer_shape(inputs, output),
             Op::ReLU => {
-                output.resize(inputs[0].len(), 0);
-
-                output.clone_from_slice(inputs[0]);
+                output.clone_from(&inputs[0]);
             }
         };
     }

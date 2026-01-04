@@ -1,112 +1,107 @@
-use std::ops::Add;
+pub const MAX_RANK: usize = 4;
 
-#[derive(Clone, Debug)]
-pub struct TensorData<T: Copy + Default + Add<Output = T>> {
-    pub data: Vec<T>,
-    strides: Vec<usize>,
+pub type TensorShape = [usize; MAX_RANK];
 
-    pub shape: Vec<usize>,
+#[derive(Debug)]
+pub struct TensorView<'a, T> {
+    pub data: &'a mut [T],
+    pub shape: TensorShape, // Capped on max_rank = 4
 }
 
-fn compute_strides(shape: &[usize]) -> Vec<usize> {
-    let mut strides = vec![1; shape.len()];
-
-    for i in (0..shape.len() - 1).rev() {
-        strides[i] = strides[i + 1] * shape[i + 1];
-    }
-
-    strides
-}
-
-impl<T: Copy + Default + Add<Output = T>> TensorData<T> {
-    pub fn index(&self, coords: &[usize]) -> usize {
-        coords.iter().zip(&self.strides).map(|(c, s)| c * s).sum()
-    }
-
-    pub fn get(&self, coords: &[usize]) -> T {
-        self.data[self.index(coords)]
-    }
-
-    pub fn set(&mut self, coords: &[usize], val: T) {
-        let idx = self.index(coords);
-        self.data[idx] = val;
-    }
-
-    pub fn add(&self, other: &TensorData<T>, output: &mut TensorData<T>) {
-        // Ensure dimensions are accurate
-        assert_eq!(self.shape, other.shape);
-        assert_eq!(other.shape, output.shape);
-
-        for ((a, b), c) in output.data.iter_mut().zip(&self.data).zip(&other.data) {
-            *a = *b + *c;
-        }
+impl<'a, T> TensorView<'a, T> {
+    pub fn from_buffer(data: &'a mut [T], shape: TensorShape) -> Self {
+        Self { data, shape }
     }
 }
 
 #[derive(Debug)]
-pub enum Tensor {
-    F32(TensorData<f32>),
-    I64(TensorData<i64>),
+pub enum Tensor<'a> {
+    F32(TensorView<'a, f32>),
+    F64(TensorView<'a, f64>),
+    I64(TensorView<'a, i64>),
 }
 
-impl Tensor {
-    pub fn new<T: IntoTensor>(data: Vec<T>, shape: Vec<usize>) -> Self {
-        // Assert that data is large enough
-        T::into_tensor(data, shape)
-    }
-
-    pub fn data<T: IntoTensor>(&self) -> Option<&[T]> {
-        T::try_get_data(self)
-    }
-
-    pub fn splat<T: IntoTensor + Clone>(val: T, shape: Vec<usize>) -> Self {
-        let data = vec![val; shape.iter().product()];
-        Self::new(data, shape)
-    }
-
-    pub fn zeros<T: IntoTensor + Clone + Default>(shape: Vec<usize>) -> Self {
-        Self::splat::<T>(Default::default(), shape)
-    }
-
-    pub fn shape(&self) -> &[usize] {
-        match self {
-            Tensor::F32(t) => &t.shape,
-            Tensor::I64(t) => &t.shape,
-        }
-    }
-}
-
-pub trait IntoTensor {
-    fn into_tensor(data: Vec<Self>, shape: Vec<usize>) -> Tensor
+pub trait ToTensor {
+    fn as_tensor<'a>(data: &'a mut Vec<Self>, shape: TensorShape) -> Tensor<'a>
     where
         Self: Sized;
 
-    fn try_get_data(tens: &Tensor) -> Option<&[Self]>
+    fn as_tensor_sliced<'a>(data: &'a mut [Self], shape: TensorShape) -> Tensor<'a>
+    where
+        Self: Sized;
+
+    fn from_tensor<'a>(tensor: &'a Tensor) -> Result<&'a [Self], String>
     where
         Self: Sized;
 }
 
-macro_rules! impl_into_tensor {
+macro_rules! impl_to_tensor {
     ($t:ty, $variant:ident) => {
-        impl IntoTensor for $t {
-            fn into_tensor(data: Vec<Self>, shape: Vec<usize>) -> Tensor {
-                let strides = compute_strides(&shape);
-                Tensor::$variant(TensorData {
-                    data,
+        impl ToTensor for $t {
+            fn as_tensor<'a>(data: &'a mut Vec<Self>, shape: TensorShape) -> Tensor<'a>
+            where
+                Self: Sized,
+            {
+                return Tensor::$variant(TensorView {
+                    data: data.as_mut_slice(),
                     shape,
-                    strides,
-                })
+                });
             }
 
-            fn try_get_data(tens: &Tensor) -> Option<&[Self]> {
-                match tens {
-                    Tensor::$variant(t) => Some(t.data.as_slice()),
-                    _ => None,
+            fn from_tensor<'a>(tensor: &'a Tensor) -> Result<&'a [Self], String>
+            where
+                Self: Sized,
+            {
+                match tensor {
+                    Tensor::$variant(view) => Ok(view.data),
+                    _ => Err(format!("Invalid tensor type retrieval")),
                 }
+            }
+
+            fn as_tensor_sliced<'a>(data: &'a mut [Self], shape: TensorShape) -> Tensor<'a>
+            where
+                Self: Sized,
+            {
+                return Tensor::$variant(TensorView { data, shape });
             }
         }
     };
 }
 
-impl_into_tensor!(f32, F32);
-impl_into_tensor!(i64, I64);
+impl_to_tensor!(f32, F32);
+impl_to_tensor!(f64, F64);
+impl_to_tensor!(i64, I64);
+
+impl<'a> Tensor<'a> {
+    pub fn new<T: ToTensor>(data: &'a mut Vec<T>, shape: TensorShape) -> Self {
+        return T::as_tensor(data, shape);
+    }
+
+    pub unsafe fn from_arena<T: ToTensor + 'a>(arena: *mut u8, byte_offset: usize, shape: TensorShape) -> Self {
+        let data = unsafe {
+            std::slice::from_raw_parts_mut(arena.add(byte_offset) as *mut T, shape.iter().product())
+        };
+
+        T::as_tensor_sliced(data, shape)
+    }
+
+    pub fn shape(&self) -> TensorShape {
+        match self {
+            Self::F32(view) => view.shape,
+            Self::I64(view) => view.shape,
+            Self::F64(view) => view.shape,
+        }
+    }
+
+    pub fn data<T: ToTensor>(&'a self) -> Result<&'a [T], String> {
+        T::from_tensor(self)
+    }
+
+    pub fn elem_size(&self) -> usize {
+        match self {
+            Self::F32(_) => size_of::<f32>(),
+            Self::F64(_) => size_of::<f64>(),
+            Self::I64(_) => size_of::<i64>(),
+        }
+    }
+}

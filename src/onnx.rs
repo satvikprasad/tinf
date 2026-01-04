@@ -1,47 +1,18 @@
 use crate::{
+    model::{Model, Node},
     onnx::proto::{NodeProto, ValueInfoProto},
     ops::{self, InferShape},
-    tensor::{self, IntoTensor, Tensor},
+    tensor::{MAX_RANK, Tensor, TensorShape},
 };
-use core::num;
-use prost::{Message, bytes::buf};
+use prost::Message;
 use std::{
+    alloc::{Layout, alloc_zeroed},
     collections::{HashMap, HashSet},
-    error::Error,
     fs,
-    hash::Hash,
 };
 
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/onnx.rs"));
-}
-
-#[derive(Debug)]
-pub struct Model {
-    buffers: Vec<Tensor>,
-}
-
-#[derive(Debug)]
-pub struct Node {
-    op: ops::Op,
-    inputs: Vec<usize>,
-    outputs: Vec<usize>,
-}
-
-fn retrieve_tens<'a>(
-    buffer: &'a [Tensor],
-    m: &HashMap<String, usize>,
-    name: &String,
-) -> Result<&'a Tensor, Box<dyn Error>> {
-    let buf_idx = *m
-        .get(name)
-        .ok_or_else(|| format!("Failed to retrieve tensor {} while parsing", name))?;
-    return Ok(&buffer[buf_idx]);
-}
-
-fn push_tens(buffer: &mut Vec<Tensor>, m: &mut HashMap<String, usize>, name: String, tens: Tensor) {
-    m.insert(name, buffer.len());
-    buffer.push(tens);
 }
 
 struct NodeAttributes {
@@ -102,41 +73,45 @@ fn parse_attrs(attributes: &[proto::AttributeProto]) -> NodeAttributes {
     }
 }
 
-// TODO(satvik): Maybe think of removing the allocations here?
-fn parse_tensor_shapes(node: &Node, shapes: &mut [Vec<usize>]) -> Result<(), Box<dyn Error>> {
-    let in0: Vec<usize> = shapes[node.inputs[0]].clone();
+/**
+ * Parses a node's output tensor shape given initialized input shapes.
+ */
+fn parse_tensor_shapes(node: &Node, shapes: &mut [(TensorShape, usize)]) {
+    let in0: TensorShape = shapes[node.inputs[0]].0; // TODO(satvik): Allocate this on a
+    // stack with a max rank.
 
     match &node.op {
         ops::Op::ReLU | ops::Op::MaxPool(_) | ops::Op::Reshape(_) => {
-            node.op.infer_shape(&[&in0], &mut shapes[node.outputs[0]]);
+            node.op.infer_shape(&[in0], &mut shapes[node.outputs[0]].0);
         }
         ops::Op::MatMul | ops::Op::Add | ops::Op::Conv(_) => {
-            let in1: Vec<usize> = shapes[node.inputs[1]].clone();
+            let in1: TensorShape = shapes[node.inputs[1]].0;
             node.op
-                .infer_shape(&[&in0, &in1], &mut shapes[node.outputs[0]]);
+                .infer_shape(&[in0, in1], &mut shapes[node.outputs[0]].0);
         }
     };
-    Ok(())
+
+    shapes[node.outputs[0]].1 = shapes[node.inputs[0]].1;
 }
 
 /**
  * Generates tensor mappings and fills parsed nodes' inputs and outputs.
  *
- * @param in_nodes Input node protos, preallocated
+ * @param node_protos Input node protos, preallocated
  * @param tensor_mapping Mapping from tensor names to their logical index, preallocated and to be
  * filled.
  * @param num_tensors Mutable reference to variable storing the number of tensors, to be filled.
- * @param out_nodes Logical nodes to be parsed
+ * @param nodes Logical nodes to be parsed
  */
 fn parse_nodes_and_generate_tensor_mappings(
-    in_nodes: &[NodeProto],
+    node_protos: &[NodeProto],
+    nodes: &mut [Node],
     tensor_mapping: &mut HashMap<String, usize>,
     num_tensors: &mut usize,
-    out_nodes: &mut [Node],
 ) {
     *num_tensors = 0usize;
 
-    for (i, n) in in_nodes.iter().enumerate() {
+    for (i, n) in node_protos.iter().enumerate() {
         for inp in &n.input {
             // TODO(satvik): Is this alloc adding overhead?
             let en = tensor_mapping.entry(inp.to_string()).or_insert_with(|| {
@@ -144,7 +119,7 @@ fn parse_nodes_and_generate_tensor_mappings(
                 *num_tensors - 1
             });
 
-            out_nodes[i].inputs.push(*en);
+            nodes[i].inputs.push(*en);
         }
 
         for out in &n.output {
@@ -153,81 +128,26 @@ fn parse_nodes_and_generate_tensor_mappings(
                 *num_tensors - 1
             });
 
-            out_nodes[i].outputs.push(*en);
+            nodes[i].outputs.push(*en);
         }
     }
 }
 
-fn parse_input_shapes(
-    inputs: Vec<ValueInfoProto>,
-    tensor_mapping: &mut HashMap<String, usize>,
-    shapes: &mut Vec<Vec<usize>>,
-) -> Result<(), Box<dyn Error>> {
-    // Parse input tensor shapes, filling shapes
-    for inp in inputs {
-        let buf_idx = *tensor_mapping
-            .get(&inp.name)
-            .ok_or_else(|| format!("No operation uses input tensor {} as input", inp.name))?;
-
-        let input_type = inp
-            .r#type
-            .ok_or_else(|| format!("Expected type of input {}", inp.name))?;
-
-        use proto::tensor_shape_proto::dimension::Value::DimValue;
-        use proto::type_proto::Value;
-
-        match input_type.value {
-            Some(Value::TensorType(tensor)) => {
-                let shape_proto = tensor.shape.ok_or_else(|| "Tensor shape expected.")?;
-                let shape: Vec<usize> = shape_proto
-                    .dim
-                    .iter()
-                    .map(|d| match d.value {
-                        Some(DimValue(v)) => v as usize,
-                        _ => panic!(),
-                    })
-                    .collect();
-
-                shapes[buf_idx] = shape;
-            }
-            _ => todo!("{:#?} not supported", input_type.value),
-        };
-    }
-
-    Ok(())
-}
-
-pub fn generate_buffer_mappings(
-    nodes: &[Node],
-    buffers: &mut [usize],
-    tensor_size: usize,
-    tensor_mapping: &mut HashMap<String, usize>,
-    ins: &[String],
-    outs: &[String],
-) -> Result<(), Box<dyn Error>> {
-    // Map ending node to tensors
-    let mut terminations = vec![Vec::<usize>::new(); nodes.len() + 2];
+/**
+ * Generate tensor -> buffer mappings given input nodes
+ *
+ * @param nodes Nodes in the logical graph
+ * @param buffers Mutable reference to tensor -> buffer mapping to be filled. buf_idx := buffer[tens_idx].
+ * @param tensor_size Number of intermediate tensors
+ * @param tensor_mapping Mapping from tensor name -> tensor idx.
+ *
+ * @return Size of the (locally) minimum number of buffers required
+ */
+fn generate_buffer_mappings(nodes: &[Node], buffers: &mut [usize], tensor_size: usize) -> usize {
     let mut adjacencies = vec![Vec::<usize>::new(); tensor_size];
 
     // Should track the start node this tensor data is required, and end node
-    let mut liveness: Vec<(usize, usize)> = vec![(0, 0); tensor_size];
-    let retr = |tens: &String| -> Result<usize, Box<dyn Error>> {
-        let tens_idx = *tensor_mapping
-            .get(tens)
-            .ok_or_else(|| format!("Tensor {} not found", tens))?;
-
-        Ok(tens_idx)
-    }; // TODO(satvik): Verify this indirection doesn't add extra overhead.
-
-    // All initializers and inputs are created at the start of inference.
-    for tens in ins {
-        liveness[retr(tens)?].0 = 0; // Tensor is created at the start of inference
-    }
-
-    // All outputs are consumed at the end of inference.
-    for tens in outs {
-        liveness[retr(tens)?].1 = nodes.len() + 1; // Tensor is created at the start of inference
-    }
+    let mut liveness: Vec<(usize, usize)> = vec![(0, nodes.len() + 1); tensor_size];
 
     // We need to map tensors to buffers, by first generating tensor liveness.
     for (i, node) in nodes.iter().enumerate() {
@@ -240,23 +160,32 @@ pub fn generate_buffer_mappings(
         }
     }
 
-    for (tens_idx, &(_, b)) in liveness.iter().enumerate() {
-        terminations[b].push(tens_idx);
-    }
+    // Iterate through all possible liveness pairs
+    for i in 0..tensor_size {
+        for j in i + 1..tensor_size {
+            let (a, b) = liveness[i];
+            let (p, q) = liveness[j];
 
-    for (i, &(a, b)) in liveness.iter().enumerate() {
-        for (j, &(p, q)) in liveness.iter().enumerate() {
-            if (p <= b && q >= a) || (q >= a && p <= b) {
+            if p <= b && q >= a {
                 adjacencies[i].push(j);
                 adjacencies[j].push(i);
             }
         }
     }
 
+    let mut max_buf = 0;
+    let mut visited = vec![false; tensor_size];
+
     for tens_idx in 0..tensor_size {
+        visited[tens_idx] = true;
+
         let mut adj_bufs = HashSet::with_capacity(adjacencies[tens_idx].len());
 
         for &nbor in &adjacencies[tens_idx] {
+            if !visited[nbor] || nbor == tens_idx {
+                continue;
+            }
+
             adj_bufs.insert(buffers[nbor]);
         }
 
@@ -266,15 +195,16 @@ pub fn generate_buffer_mappings(
         }
 
         buffers[tens_idx] = buf_idx;
+        max_buf = max_buf.max(buf_idx);
     }
 
-    Ok(())
+    max_buf + 1
 }
 
-fn parse_op(node: &NodeProto, initializers: &HashMap<String, Tensor>) -> ops::Op {
+fn parse_op(node: &NodeProto, initializers: &HashMap<String, Tensor>) -> Result<ops::Op, String> {
     let attrs = parse_attrs(node.attribute.as_slice());
 
-    match node.op_type.as_str() {
+    let op = match node.op_type.as_str() {
         "Add" => ops::Op::Add,
         "Conv" => {
             let cd = ops::ConvData {
@@ -302,39 +232,142 @@ fn parse_op(node: &NodeProto, initializers: &HashMap<String, Tensor>) -> ops::Op
         }
         "Reshape" => {
             let shape_tensor = &initializers[&node.input[1]];
+            let output_shape: TensorShape = to_stack_shape(
+                shape_tensor
+                    .data::<i64>()?
+                    .iter()
+                    .map(|&v| v as usize)
+                    .collect(),
+            )?;
 
-            match shape_tensor {
-                Tensor::I64(tensor_data) => ops::Op::Reshape(ops::ReshapeData {
-                    output_shape: tensor_data.data.iter().map(|&v| v as usize).collect(),
-                }),
-                _ => panic!(),
-            }
+            ops::Op::Reshape(ops::ReshapeData { output_shape })
         }
         op => todo!("{} op not supported", op),
+    };
+
+    Ok(op)
+}
+
+fn parse_input_shapes(
+    shapes: &mut [(TensorShape, usize)],
+    inputs: &[ValueInfoProto],
+    initializers: &HashMap<String, Tensor>,
+    tensor_mapping: &HashMap<String, usize>,
+) -> Result<(), String> {
+    for inp in inputs {
+        let input_type = inp
+            .r#type
+            .as_ref()
+            .ok_or_else(|| format!("Expected graph input {} to have a type", inp.name))?;
+
+        let tens_idx = *tensor_mapping.get(&inp.name).ok_or_else(|| format!(""))?;
+
+        match &input_type.value {
+            Some(proto::type_proto::Value::TensorType(tensor)) => {
+                use proto::tensor_shape_proto::dimension::Value::DimValue;
+                let shape_proto = tensor
+                    .shape
+                    .as_ref()
+                    .ok_or_else(|| "Tensor shape expected.")?;
+
+                use proto::tensor_proto::DataType;
+
+                let sz = match DataType::try_from(tensor.elem_type)
+                    .map_err(|d| format!("Invalid tensor element type encountered {}", d))?
+                {
+                    DataType::Float => size_of::<f32>(),
+                    DataType::Int64 => size_of::<i64>(),
+                    _ => panic!(),
+                };
+
+                shapes[tens_idx].0 = to_stack_shape(
+                    shape_proto
+                        .dim
+                        .iter()
+                        .map(|d| match d.value {
+                            Some(DimValue(v)) => v as usize,
+                            _ => panic!(),
+                        })
+                        .collect(),
+                )?; // TODO(satvik): Allow to_stack_shape to take in an iterator
+
+                shapes[tens_idx].1 = sz;
+            }
+            _ => todo!("{:#?} not supported", input_type.value),
+        }
+    }
+
+    // Parse initializer shapes
+    for (tensor_name, tensor) in initializers {
+        let tens_idx = *tensor_mapping.get(tensor_name).ok_or_else(|| format!(""))?;
+
+        shapes[tens_idx].0 = tensor.shape();
+        shapes[tens_idx].1 = tensor.elem_size();
+    }
+
+    Ok(())
+}
+
+fn to_stack_shape(shape: Vec<usize>) -> Result<TensorShape, String> {
+    if shape.len() > MAX_RANK {
+        return Err(format!(
+            "tinf only supports tensors with max rank {}, encountered rank {}",
+            MAX_RANK,
+            shape.len()
+        ));
+    }
+
+    let mut stack_shape = [1usize; MAX_RANK];
+
+    for (i, &dim) in shape.iter().rev().enumerate() {
+        stack_shape[MAX_RANK - 1 - i] = dim;
+    }
+
+    Ok(stack_shape)
+}
+
+/**
+ * Parses initializer tensor from a TensorProto. Performs no allocations for tensor data.
+ *
+ * @param t TensorProto to parse
+ * @return (name, tensor)
+ */
+fn parse_initializer<'a>(t: &'a mut proto::TensorProto) -> Result<(String, Tensor<'a>), String> {
+    use proto::tensor_proto::DataType;
+    use std::convert::TryFrom;
+
+    let dt = DataType::try_from(t.data_type)
+        .map_err(|_| format!("Unknown datatype encountered: {}", t.data_type))?;
+    let shape: TensorShape = to_stack_shape(t.dims.iter().map(|&d| d as usize).collect())?;
+
+    match dt {
+        DataType::Float => Ok((t.name.clone(), Tensor::new(&mut t.float_data, shape))),
+        DataType::Int64 => Ok((t.name.clone(), Tensor::new(&mut t.int64_data, shape))),
+        _ => {
+            println!("{:#?}", dt);
+            todo!();
+        }
     }
 }
 
-pub fn parse(path: &str) -> Result<(), Box<dyn Error>> {
-    let bytes = fs::read(path)?;
-    let proto = proto::ModelProto::decode(bytes.as_slice())?;
+pub fn parse(path: &str) -> Result<Model, String> {
+    let bytes = fs::read(path).map_err(|e| format!("Error reading file {}", e))?;
+    let proto = proto::ModelProto::decode(bytes.as_slice())
+        .map_err(|e| format!("Error decoding ONNX format: {}", e))?;
 
-    let g = proto.graph.ok_or("Model did not contain a graph.")?;
+    let mut g = proto
+        .graph
+        .ok_or_else(|| "Model did not contain a graph.")?;
 
     let mut tensor_size = 0usize;
     let mut tensor_mapping =
         HashMap::<String, usize>::with_capacity(g.node.len() + g.input.len() + g.output.len());
 
-    let mut ins = Vec::<String>::with_capacity(g.input.len() + g.initializer.len());
-
-    let mut initializers = HashMap::<String, Tensor>::with_capacity(g.initializer.len());
-    for init in g.initializer {
-        let (name, tens) = parse_initializer(init)?;
-
-        initializers.insert(name.clone(), tens);
-        ins.push(name);
-    }
-
-    let outs: Vec<String> = g.output.into_iter().map(|v| v.name).collect();
+    let initializers: HashMap<String, Tensor> = g
+        .initializer
+        .iter_mut()
+        .map(|init| parse_initializer(init))
+        .collect::<Result<_, _>>()?;
 
     let mut nodes: Vec<Node> = g
         .node
@@ -342,89 +375,70 @@ pub fn parse(path: &str) -> Result<(), Box<dyn Error>> {
         .map(|n| Node {
             inputs: Vec::with_capacity(n.input.len()),
             outputs: Vec::with_capacity(n.output.len()),
-            op: parse_op(n, &initializers), // TODO(satvik): Parse the operation here properly
+            op: parse_op(n, &initializers).unwrap(), // TODO(satvik): Parse the operation here properly
         })
         .collect(); // Pre-allocate space for nodes.
 
     parse_nodes_and_generate_tensor_mappings(
         &g.node,
+        &mut nodes,
         &mut tensor_mapping,
         &mut tensor_size,
-        &mut nodes,
     );
 
+    // Maps tensors to their corresponding buffers
     let mut buffers = vec![0usize; tensor_size];
-    generate_buffer_mappings(
-        nodes.as_slice(),
-        buffers.as_mut_slice(),
-        tensor_size,
-        &mut tensor_mapping,
-        ins.as_slice(),
-        outs.as_slice(),
-    )?;
+    let num_buffers =
+        generate_buffer_mappings(nodes.as_slice(), buffers.as_mut_slice(), tensor_size);
 
-    // We've generated every buffer. We can now perform shape inference on each tensor,
-    // and then determine max sizes of tensors in each buffer.
+    let mut shapes = vec![([0usize; MAX_RANK], 0usize); tensor_size]; // Shapes for each in/out tensor
 
-    println!("{:#?}", buffers);
+    // Shape inference
+    {
+        parse_input_shapes(
+            &mut shapes.as_mut_slice(),
+            &g.input,
+            &initializers,
+            &tensor_mapping,
+        )?;
 
-    let mut shapes = vec![Vec::new(); tensor_size]; // Shapes for each in/out tensor
-    // parse_input_shapes(g.input, &mut tensor_mapping, &mut shapes)?;
-    for inp in g.input {
-        let input_type = inp
-            .r#type
-            .ok_or_else(|| format!("Expected graph input {} to have type", inp.name))?;
-
-        let tens_idx = *tensor_mapping.get(&inp.name).ok_or_else(|| format!(""))?;
-
-        match input_type.value {
-            Some(proto::type_proto::Value::TensorType(tensor)) => {
-                use proto::tensor_shape_proto::dimension::Value::DimValue;
-                let shape_proto = tensor.shape.ok_or_else(|| "Tensor shape expected.")?;
-
-                shapes[tens_idx].extend(shape_proto.dim.iter().map(|d| match d.value {
-                    Some(DimValue(v)) => v as usize,
-                    _ => panic!(),
-                }));
-            }
-            _ => todo!("{:#?} not supported", input_type.value),
-        }
-
-        ins.push(inp.name);
-    }
-
-    for (tensor_name, tens) in &initializers {
-        let tens_idx = *tensor_mapping.get(tensor_name).ok_or_else(|| format!(""))?;
-
-        shapes[tens_idx].extend(tens.shape().iter().map(|&v| v));
-    }
-
-    for node in &nodes {
-        parse_tensor_shapes(node, shapes.as_mut_slice());
-    }
-
-    println!("{:#?} {}", shapes, shapes.len());
-    println!("{:#?}", tensor_mapping);
-
-    Ok(())
-}
-
-/**
- * Performs no allocations for tensor data.
- */
-fn parse_initializer(t: proto::TensorProto) -> Result<(String, Tensor), Box<dyn Error>> {
-    use proto::tensor_proto::DataType;
-    use std::convert::TryFrom;
-
-    let dt = DataType::try_from(t.data_type)?;
-    let shape: Vec<usize> = t.dims.into_iter().map(|d| d as usize).collect();
-
-    match dt {
-        DataType::Float => Ok((t.name, Tensor::new(t.float_data, shape))),
-        DataType::Int64 => Ok((t.name, Tensor::new(t.int64_data, shape))),
-        _ => {
-            println!("{:#?}", dt);
-            todo!();
+        for node in &nodes {
+            parse_tensor_shapes(node, shapes.as_mut_slice());
         }
     }
+
+    // For each buffer, compute the largest tensor stored in that buffer
+    let mut buffer_sizes = vec![0usize; num_buffers];
+    for (tensor, &buffer) in buffers.iter().enumerate() {
+        let (shape, size) = &shapes[tensor];
+
+        let num_elements = shape.iter().product::<usize>();
+        buffer_sizes[buffer] = buffer_sizes[buffer].max(num_elements * size);
+    }
+
+    let mut offset = 0;
+    let buffer_offsets = buffer_sizes
+        .iter()
+        .map(|sz| {
+            offset += sz;
+            offset - sz
+        })
+        .collect();
+
+    // 64 byte alignment for a cache line.
+    let layout = Layout::from_size_align(buffer_sizes.iter().sum::<usize>(), 64)
+        .map_err(|e| format!("Error allocating arena: {}", e))?;
+    let arena = unsafe { alloc_zeroed(layout) };
+
+    Ok(Model {
+        nodes,
+        tensor_buffer_mapping: buffers,
+        tensor_shapes: shapes,
+
+        buffer_sizes: buffer_sizes,
+        buffer_offsets: buffer_offsets,
+
+        arena_layout: layout,
+        arena,
+    })
 }
