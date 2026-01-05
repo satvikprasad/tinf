@@ -2,7 +2,7 @@ use crate::{
     model::{Model, Node},
     onnx::proto::{NodeProto, ValueInfoProto},
     ops::{self, InferShape},
-    tensor::{MAX_RANK, Tensor, TensorShape},
+    tensor::{MAX_RANK, Tensor, TensorShape, TensorType},
 };
 use prost::Message;
 use std::{
@@ -76,22 +76,23 @@ fn parse_attrs(attributes: &[proto::AttributeProto]) -> NodeAttributes {
 /**
  * Parses a node's output tensor shape given initialized input shapes.
  */
-fn parse_tensor_shapes(node: &Node, shapes: &mut [(TensorShape, usize)]) {
-    let in0: TensorShape = shapes[node.inputs[0]].0; // TODO(satvik): Allocate this on a
+fn parse_tensor_shapes(node: &Node, shapes: &mut [TensorShape], types: &mut [TensorType]) {
+    let in0: TensorShape = shapes[node.inputs[0]]; // TODO(satvik): Allocate this on a
     // stack with a max rank.
 
     match &node.op {
         ops::Op::ReLU | ops::Op::MaxPool(_) | ops::Op::Reshape(_) => {
-            node.op.infer_shape(&[in0], &mut shapes[node.outputs[0]].0);
+            node.op.infer_shape(&[in0], &mut shapes[node.outputs[0]]);
         }
         ops::Op::MatMul | ops::Op::Add | ops::Op::Conv(_) => {
-            let in1: TensorShape = shapes[node.inputs[1]].0;
+            let in1: TensorShape = shapes[node.inputs[1]];
             node.op
-                .infer_shape(&[in0, in1], &mut shapes[node.outputs[0]].0);
+                .infer_shape(&[in0, in1], &mut shapes[node.outputs[0]]);
         }
     };
 
-    shapes[node.outputs[0]].1 = shapes[node.inputs[0]].1;
+    // Ouptut type is the first input type for all the supported operations.
+    types[node.outputs[0]] = types[node.inputs[0]];
 }
 
 /**
@@ -249,7 +250,8 @@ fn parse_op(node: &NodeProto, initializers: &HashMap<String, Tensor>) -> Result<
 }
 
 fn parse_input_shapes(
-    shapes: &mut [(TensorShape, usize)],
+    shapes: &mut [TensorShape],
+    types: &mut [TensorType],
     inputs: &[ValueInfoProto],
     initializers: &HashMap<String, Tensor>,
     tensor_mapping: &HashMap<String, usize>,
@@ -272,15 +274,15 @@ fn parse_input_shapes(
 
                 use proto::tensor_proto::DataType;
 
-                let sz = match DataType::try_from(tensor.elem_type)
+                types[tens_idx] = match DataType::try_from(tensor.elem_type)
                     .map_err(|d| format!("Invalid tensor element type encountered {}", d))?
                 {
-                    DataType::Float => size_of::<f32>(),
-                    DataType::Int64 => size_of::<i64>(),
+                    DataType::Float => TensorType::F32,
+                    DataType::Int64 => TensorType::I64,
                     _ => panic!(),
                 };
 
-                shapes[tens_idx].0 = to_stack_shape(
+                shapes[tens_idx] = to_stack_shape(
                     shape_proto
                         .dim
                         .iter()
@@ -290,8 +292,6 @@ fn parse_input_shapes(
                         })
                         .collect(),
                 )?; // TODO(satvik): Allow to_stack_shape to take in an iterator
-
-                shapes[tens_idx].1 = sz;
             }
             _ => todo!("{:#?} not supported", input_type.value),
         }
@@ -301,8 +301,8 @@ fn parse_input_shapes(
     for (tensor_name, tensor) in initializers {
         let tens_idx = *tensor_mapping.get(tensor_name).ok_or_else(|| format!(""))?;
 
-        shapes[tens_idx].0 = tensor.shape();
-        shapes[tens_idx].1 = tensor.elem_size();
+        shapes[tens_idx] = tensor.shape();
+        types[tens_idx] = tensor.get_type();
     }
 
     Ok(())
@@ -391,33 +391,33 @@ pub fn parse(path: &str) -> Result<Model, String> {
     let num_buffers =
         generate_buffer_mappings(nodes.as_slice(), buffers.as_mut_slice(), tensor_size);
 
-    let mut shapes = vec![([0usize; MAX_RANK], 0usize); tensor_size]; // Shapes for each in/out tensor
+    let mut shapes = vec![[0usize; MAX_RANK]; tensor_size]; // Shapes for each in/out tensor
+    let mut types = vec![TensorType::F32; tensor_size];
 
     // Shape inference
     {
         parse_input_shapes(
             &mut shapes.as_mut_slice(),
+            &mut types.as_mut_slice(),
             &g.input,
             &initializers,
             &tensor_mapping,
         )?;
 
         for node in &nodes {
-            parse_tensor_shapes(node, shapes.as_mut_slice());
+            parse_tensor_shapes(node, shapes.as_mut_slice(), types.as_mut_slice());
         }
     }
 
     // For each buffer, compute the largest tensor stored in that buffer
     let mut buffer_sizes = vec![0usize; num_buffers];
     for (tensor, &buffer) in buffers.iter().enumerate() {
-        let (shape, size) = &shapes[tensor];
-
-        let num_elements = shape.iter().product::<usize>();
-        buffer_sizes[buffer] = buffer_sizes[buffer].max(num_elements * size);
+        let num_elements = shapes[tensor].iter().product::<usize>();
+        buffer_sizes[buffer] = buffer_sizes[buffer].max(num_elements * types[tensor].elem_size());
     }
 
     let mut offset = 0;
-    let buffer_offsets = buffer_sizes
+    let buffer_offsets: Vec<usize> = buffer_sizes
         .iter()
         .map(|sz| {
             offset += sz;
@@ -430,10 +430,43 @@ pub fn parse(path: &str) -> Result<Model, String> {
         .map_err(|e| format!("Error allocating arena: {}", e))?;
     let arena = unsafe { alloc_zeroed(layout) };
 
+    for (tensor_name, tensor) in initializers {
+        let tens_idx = tensor_mapping[&tensor_name];
+        let buf_idx = buffers[tens_idx];
+        let r#type = types[tens_idx];
+
+        let mut output_tensor = unsafe {
+            Tensor::from_arena(
+                arena,
+                buffer_offsets[buf_idx],
+                shapes[tens_idx],
+                types[tens_idx],
+            )
+        };
+
+        match r#type {
+            TensorType::F32 => {
+                let output_data: &mut [f32] = output_tensor.data_mut()?;
+                output_data.copy_from_slice(tensor.data()?);
+            }
+
+            TensorType::I64 => {
+                let output_data: &mut [i64] = output_tensor.data_mut()?;
+                output_data.copy_from_slice(tensor.data()?);
+            }
+
+            TensorType::F64 => {
+                let output_data: &mut [f64] = output_tensor.data_mut()?;
+                output_data.copy_from_slice(tensor.data()?);
+            }
+        }
+    }
+
     Ok(Model {
         nodes,
         tensor_buffer_mapping: buffers,
         tensor_shapes: shapes,
+        tensor_types: types,
 
         buffer_sizes: buffer_sizes,
         buffer_offsets: buffer_offsets,

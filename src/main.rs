@@ -1,16 +1,20 @@
-mod onnx;
-mod tensor;
-mod ops;
 mod model;
-
-#[cfg(feature = "dhat-heap")]
-#[global_allocator]
-static ALLOC: dhat::Alloc = dhat::Alloc;
+mod onnx;
+mod ops;
+mod tensor;
 
 fn main() {
-    #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::new_heap();
+    let mut model = onnx::parse("models/mnist-12.onnx").unwrap();
+    let start = std::time::Instant::now();
+    let iterations = 1000;
 
-    let model = onnx::parse("models/mnist-12.onnx").unwrap();
-    model.execute();
+    for _ in 0..iterations {
+        model.execute();
+    }
+
+    let elapsed = start.elapsed();
+    println!(
+        "{:.2} ms/inference",
+        elapsed.as_secs_f64() * 1000.0 / iterations as f64
+    );
 }
