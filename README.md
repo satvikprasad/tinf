@@ -13,7 +13,7 @@ Tinf currently supports the following elementary tensor ops:
 ## Benchmarks
 | Model | Input Shape | Tinf (ms / inference) |
 | ----- | --- | --- |
-| MNIST MLP | [1, 784] | 0.73 |
+| MNIST MLP | [1, 784] | 0.48 |
 
 *Benchmarks run on Apple M4, singlethreaded.*
 
