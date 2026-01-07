@@ -1,6 +1,8 @@
+use std::simd::num::SimdFloat;
+
 use crate::{
     model::Model,
-    tensor::{self, MAX_RANK, Tensor, TensorShape, TensorView},
+    tensor::{MAX_RANK, Tensor, TensorShape},
 };
 
 pub trait InferShape {
@@ -323,20 +325,176 @@ macro_rules! retr_tensor {
     };
 }
 
+pub fn relu(a: &[f32], a_shape: TensorShape, _a_strides: [usize; MAX_RANK], output: &mut [f32]) {
+    let lanes = std::simd::f32x64::LEN;
+    let chunks: usize = a_shape.iter().product::<usize>() / lanes;
+
+    for i in 0..chunks {
+        let idx = i * lanes;
+        let v = std::simd::f32x64::from_slice(&a[idx..idx + lanes]);
+
+        v.simd_max(std::simd::f32x64::splat(0.0))
+            .copy_to_slice(&mut output[idx..idx + lanes]);
+    }
+
+    for i in chunks * lanes..output.len() {
+        output[i] = a[i].max(0.0);
+    }
+}
+
+pub fn matmul(
+    a: &[f32],
+    a_shape: TensorShape,
+    a_strides: [usize; MAX_RANK],
+    b: &[f32],
+    b_shape: TensorShape,
+    b_strides: [usize; MAX_RANK],
+    output: &mut [f32],
+    output_shape: TensorShape,
+    output_strides: [usize; MAX_RANK],
+) {
+    const TILE_SIZE: usize = 32;
+
+    let m = output_shape[MAX_RANK - 2];
+    let n = output_shape[MAX_RANK - 1];
+
+    let inner_dim = a_shape[MAX_RANK - 1];
+    let inner_dim_tiled = inner_dim / TILE_SIZE;
+
+    let tiled_height = m / TILE_SIZE;
+    let tiled_width = n / TILE_SIZE;
+
+    let batch_size: usize = output_shape.iter().take(MAX_RANK - 2).product();
+
+    // TODO(satvik): Transpose b_data for better cache locality.
+    for k in 0..batch_size {
+        // Handle broadcasting (TODO(satvik): This is definitely wrong for input
+        // channels > 1)
+        let mut a_start = 0;
+        let mut b_start = 0;
+        let mut remaining = k;
+
+        // Iterate through batch dimensions
+        for dim in (0..MAX_RANK - 2).rev() {
+            let out_dim_size = output_shape[dim];
+            let idx = remaining % out_dim_size;
+            remaining /= out_dim_size;
+
+            // Clamp index to handle broadcasting (size-1 dimension broadcasts)
+            let a_idx = idx.min(a_shape[dim].saturating_sub(1));
+            let b_idx = idx.min(b_shape[dim].saturating_sub(1));
+
+            a_start += a_idx * a_strides[dim];
+            b_start += b_idx * b_strides[dim];
+        }
+
+        let batch_offset = k * m * n;
+
+        // Iterating through dimensions other than width, height.
+        for i in 0..tiled_height {
+            let tile_row_start = i * TILE_SIZE;
+            for j in 0..tiled_width {
+                let tile_col_start = j * TILE_SIZE;
+
+                for i_inner in 0..TILE_SIZE {
+                    let output_row =
+                        batch_offset + (tile_row_start + i_inner) * output_strides[MAX_RANK - 2];
+
+                    for j_inner in 0..TILE_SIZE {
+                        output[output_row
+                            + (tile_col_start + j_inner) * output_strides[MAX_RANK - 1]] = 0f32;
+                    }
+                }
+
+                // Working with tile[i, j]
+                for l in 0..inner_dim_tiled {
+                    // We have to naively multiply the tiles a[i, l] and b[l, j] and
+                    // store that in the tile out[i, j].
+                    let tile_k_start = l * TILE_SIZE;
+
+                    for i_inner in 0..TILE_SIZE {
+                        let output_row = batch_offset
+                            + (tile_row_start + i_inner) * output_strides[MAX_RANK - 2];
+
+                        let a_row = a_start + (tile_row_start + i_inner) * a_strides[MAX_RANK - 2];
+
+                        for k_inner in 0..TILE_SIZE {
+                            let a_val =
+                                a[a_row + (tile_k_start + k_inner) * a_strides[MAX_RANK - 1]];
+                            let b_row =
+                                b_start + (tile_k_start + k_inner) * b_strides[MAX_RANK - 2];
+
+                            for j_inner in 0..TILE_SIZE {
+                                // Index the output tile at [i_inner, j_inner]
+                                // Index the first tile at [i_inner, k_inner], and
+                                // index the second tile at [k_inner, j_inner]
+                                output[output_row
+                                    + (tile_col_start + j_inner) * output_strides[MAX_RANK - 1]] +=
+                                    a_val
+                                        * b[b_row
+                                            + (tile_col_start + j_inner) * b_strides[MAX_RANK - 1]];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle remainder rows
+        for i in TILE_SIZE * tiled_height..m {
+            let a_row = a_start + i * a_strides[MAX_RANK - 2];
+            let output_row = batch_offset + i * output_strides[MAX_RANK - 2];
+
+            for j in 0..n {
+                output[output_row + j * output_strides[MAX_RANK - 1]] = 0f32;
+            }
+
+            for k in 0..inner_dim {
+                let b_row = b_start + k * b_strides[MAX_RANK - 2];
+                let a_val = a[a_row + k];
+
+                for j in 0..n {
+                    output[output_row + j * output_strides[MAX_RANK - 1]] +=
+                        a_val * b[b_row + j * b_strides[MAX_RANK - 1]];
+                }
+            }
+        }
+
+        // Handle remainder cols
+        for i in 0..TILE_SIZE * tiled_height {
+            let a_row = a_start + i * a_strides[MAX_RANK - 2];
+            let output_row = batch_offset + i * output_strides[MAX_RANK - 2];
+
+            for j in TILE_SIZE * tiled_width..n {
+                output[output_row + j * output_strides[MAX_RANK - 1]] = 0f32;
+            }
+
+            for k in 0..inner_dim {
+                let b_row = b_start + k * b_strides[MAX_RANK - 2];
+                let a_val = a[a_row + k];
+
+                for j in TILE_SIZE * tiled_width..n {
+                    output[output_row + j * output_strides[MAX_RANK - 1]] +=
+                        a_val * b[b_row + j * b_strides[MAX_RANK - 1]];
+                }
+            }
+        }
+    }
+}
+
 impl Execute for Op {
     fn execute(&self, inputs: &[usize], outputs: &[usize], model: &Model) {
         match self {
             Op::ReLU => {
-                let in_tensor = retr_tensor!(model, inputs[0]);
-                let mut out_tensor = retr_tensor!(model, outputs[0]);
+                let a = retr_tensor!(model, inputs[0]);
+                let mut output = retr_tensor!(model, outputs[0]);
 
-                for (out_elem, in_elem) in out_tensor
-                    .data_mut_unchecked::<f32>()
-                    .iter_mut()
-                    .zip(in_tensor.data_unchecked::<f32>().iter())
-                {
-                    *out_elem = in_elem.max(0f32);
-                }
+                relu(
+                    a.data_unchecked(),
+                    a.shape(),
+                    a.strides(),
+                    output.data_mut_unchecked(),
+                );
             }
             Op::Add => {
                 let a = retr_tensor!(model, inputs[0]);
@@ -371,40 +529,23 @@ impl Execute for Op {
             }
             Op::MatMul => {
                 let a = retr_tensor!(model, inputs[0]);
-                let a_data: &[f32] = a.data_unchecked();
-
                 let b = retr_tensor!(model, inputs[1]);
-                let b_data: &[f32] = b.data_unchecked();
 
-                let mut out_tensor = retr_tensor!(model, outputs[0]);
-                let out_size = out_tensor.shape().iter().product::<usize>();
-                let out_strides = out_tensor.strides();
-                let out_tensor_data: &mut [f32] = out_tensor.data_mut_unchecked();
+                let mut output = retr_tensor!(model, outputs[0]);
+                let output_shape = output.shape();
+                let output_strides = output.strides();
 
-                // TODO(satvik): Transpose b_data for better cache locality.
-                for i in 0..out_size {
-                    let mut curr = i;
-
-                    let mut a_start = 0;
-                    let mut b_start = 0;
-
-                    for k in 0..MAX_RANK - 2 {
-                        a_start += (curr / out_strides[k]).min(a.shape()[k] - 1) * a.strides()[k];
-                        b_start += (curr / out_strides[k]).min(b.shape()[k] - 1) * b.strides()[k];
-
-                        curr = curr % out_strides[k];
-                    }
-
-                    out_tensor_data[i] = 0f32;
-
-                    let m = curr / out_strides[MAX_RANK - 2];
-                    let n = (curr % out_strides[MAX_RANK - 2]) / out_strides[MAX_RANK - 1];
-
-                    for k in 0..a.shape()[MAX_RANK - 1] {
-                        out_tensor_data[i] += a_data[a_start + a.strides()[MAX_RANK - 2] * m + k]
-                            * b_data[b_start + k * b.strides()[MAX_RANK - 2] + n];
-                    }
-                }
+                matmul(
+                    a.data_unchecked(),
+                    a.shape(),
+                    a.strides(),
+                    b.data_unchecked(),
+                    b.shape(),
+                    b.strides(),
+                    output.data_mut_unchecked(),
+                    output_shape,
+                    output_strides,
+                );
             }
             Op::Conv(conv_data) => {
                 if conv_data.group != 1 {

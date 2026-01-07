@@ -1,3 +1,7 @@
+#![feature(portable_simd)]
+
+use crate::ops::matmul;
+
 mod model;
 mod onnx;
 mod ops;
@@ -6,7 +10,7 @@ mod tensor;
 fn main() {
     let mut model = onnx::parse("models/mnist-12.onnx").unwrap();
     let start = std::time::Instant::now();
-    let iterations = 1000;
+    let iterations = 10000;
 
     for _ in 0..iterations {
         model.execute();
