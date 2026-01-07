@@ -430,37 +430,10 @@ pub fn parse(path: &str) -> Result<Model, String> {
         .map_err(|e| format!("Error allocating arena: {}", e))?;
     let arena = unsafe { alloc_zeroed(layout) };
 
-    for (tensor_name, tensor) in initializers {
-        let tens_idx = tensor_mapping[&tensor_name];
-        let buf_idx = buffers[tens_idx];
-        let r#type = types[tens_idx];
-
-        let mut output_tensor = unsafe {
-            Tensor::from_arena(
-                arena,
-                buffer_offsets[buf_idx],
-                shapes[tens_idx],
-                types[tens_idx],
-            )
-        };
-
-        match r#type {
-            TensorType::F32 => {
-                let output_data: &mut [f32] = output_tensor.data_mut()?;
-                output_data.copy_from_slice(tensor.data()?);
-            }
-
-            TensorType::I64 => {
-                let output_data: &mut [i64] = output_tensor.data_mut()?;
-                output_data.copy_from_slice(tensor.data()?);
-            }
-
-            TensorType::F64 => {
-                let output_data: &mut [f64] = output_tensor.data_mut()?;
-                output_data.copy_from_slice(tensor.data()?);
-            }
-        }
-    }
+    let init_indexed = initializers
+        .into_iter()
+        .map(|(k, v)| (tensor_mapping[&k], Vec::from(&v)))
+        .collect();
 
     Ok(Model {
         nodes,
@@ -473,5 +446,7 @@ pub fn parse(path: &str) -> Result<Model, String> {
 
         arena_layout: layout,
         arena,
+
+        initializers: init_indexed,
     })
 }

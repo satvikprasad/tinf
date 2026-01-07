@@ -1,4 +1,4 @@
-use std::simd::num::SimdFloat;
+use std::{ops::Range, simd::num::SimdFloat};
 
 use crate::{
     model::Model,
@@ -325,6 +325,245 @@ macro_rules! retr_tensor {
     };
 }
 
+pub fn naive_conv(
+    a: &[f32],
+    a_shape: TensorShape,
+    a_strides: [usize; MAX_RANK],
+    kernel: &[f32],
+    kernel_shape: TensorShape,
+    kernel_strides: [usize; MAX_RANK],
+    dilations: [usize; 2],
+    pads: [usize; 4],
+    strides: [usize; 2],
+    input_batch_offset: usize,
+    output_batch_offset: usize,
+    channel_range: Range<usize>,
+    row_range: Range<usize>,
+    col_range: Range<usize>,
+    output: &mut [f32],
+    _output_shape: TensorShape,
+    output_strides: [usize; MAX_RANK],
+) {
+    for channel in channel_range.clone() {
+        for row in row_range.clone() {
+            for col in col_range.clone() {
+                output[output_batch_offset
+                    + channel * output_strides[MAX_RANK - 3]
+                    + row * output_strides[MAX_RANK - 2]
+                    + col * output_strides[MAX_RANK - 1]] = 0f32;
+            }
+        }
+    }
+
+    for ic in 0..kernel_shape[MAX_RANK - 3] {
+        let k_ic_offset = ic * kernel_strides[MAX_RANK - 3];
+        let a_ic_offset = input_batch_offset + ic * a_strides[MAX_RANK - 3];
+
+        for kh in 0..kernel_shape[MAX_RANK - 2] {
+            let k_kh_offset = kh * kernel_strides[MAX_RANK - 2] + k_ic_offset;
+
+            for kw in 0..kernel_shape[MAX_RANK - 1] {
+                let k_kw_offset = k_kh_offset + kw * kernel_strides[MAX_RANK - 1];
+
+                for channel in channel_range.clone() {
+                    let kernel_val = kernel[channel * kernel_strides[MAX_RANK - 4] + k_kw_offset];
+                    let out_c_offset = output_batch_offset + channel * output_strides[MAX_RANK - 3];
+
+                    for row in row_range.clone() {
+                        let a_row =
+                            (row * strides[0] + kh * dilations[0]) as isize - pads[0] as isize;
+                        if a_row as usize >= a_shape[MAX_RANK - 2] {
+                            continue;
+                        }
+
+                        let a_row_offset = a_ic_offset + (a_row as usize) * a_strides[MAX_RANK - 2];
+                        let out_row_offset = out_c_offset + row * output_strides[MAX_RANK - 2];
+
+                        for col in col_range.clone() {
+                            let a_col =
+                                (col * strides[1] + kw * dilations[1]) as isize - pads[1] as isize;
+                            if a_col as usize >= a_shape[MAX_RANK - 1] {
+                                continue;
+                            }
+
+                            output[out_row_offset + col * output_strides[MAX_RANK - 1]] +=
+                                kernel_val
+                                    * a[a_row_offset + (a_col as usize) * a_strides[MAX_RANK - 1]];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn conv(
+    a: &[f32],
+    a_shape: TensorShape,
+    a_strides: [usize; MAX_RANK],
+    kernel: &[f32],
+    kernel_shape: TensorShape,
+    kernel_strides: [usize; MAX_RANK],
+    dilations: [usize; 2],
+    pads: [usize; 4],
+    strides: [usize; 2],
+    output: &mut [f32],
+    output_shape: TensorShape,
+    output_strides: [usize; MAX_RANK],
+) {
+    const TILE_SIZE_C: usize = 16;
+    const TILE_SIZE_H: usize = 8;
+    const TILE_SIZE_W: usize = 8;
+
+    let batch_dim: usize = output_shape.iter().take(MAX_RANK - 3).product();
+    let channels = output_shape[MAX_RANK - 3];
+    let height = output_shape[MAX_RANK - 2];
+    let width = output_shape[MAX_RANK - 1];
+
+    for b in 0..batch_dim {
+        let batch_offset = b * output_strides[MAX_RANK - 4];
+        let input_batch_offset = b * a_strides[MAX_RANK - 4];
+
+        for tile_channel in 0..channels / TILE_SIZE_C {
+            let channel_start = tile_channel * TILE_SIZE_C;
+
+            for tile_row in 0..height / TILE_SIZE_H {
+                let row_start = tile_row * TILE_SIZE_H;
+
+                for tile_col in 0..width / TILE_SIZE_W {
+                    let col_start = tile_col * TILE_SIZE_W;
+
+                    for channel in channel_start..channel_start + TILE_SIZE_C {
+                        for row in row_start..row_start + TILE_SIZE_H {
+                            for col in col_start..col_start + TILE_SIZE_W {
+                                output[batch_offset
+                                    + channel * output_strides[MAX_RANK - 3]
+                                    + row * output_strides[MAX_RANK - 2]
+                                    + col * output_strides[MAX_RANK - 1]] = 0f32;
+                            }
+                        }
+                    }
+
+                    for input_channel in 0..a_shape[MAX_RANK - 3] {
+                        let a_channel_offset =
+                            input_batch_offset + input_channel * a_strides[MAX_RANK - 3];
+
+                        for kh in 0..kernel_shape[MAX_RANK - 2] {
+                            for kw in 0..kernel_shape[MAX_RANK - 1] {
+                                for inner_c in 0..TILE_SIZE_C {
+                                    let channel = channel_start + inner_c;
+                                    let channel_offset =
+                                        batch_offset + channel * output_strides[MAX_RANK - 3];
+
+                                    let kernel_val = kernel[channel * kernel_strides[MAX_RANK - 4]
+                                        + input_channel * kernel_strides[MAX_RANK - 3]
+                                        + kh * kernel_strides[MAX_RANK - 2]
+                                        + kw * kernel_strides[MAX_RANK - 1]];
+
+                                    for inner_row in 0..TILE_SIZE_H {
+                                        let row = row_start + inner_row;
+                                        let row_offset =
+                                            channel_offset + row * output_strides[MAX_RANK - 2];
+
+                                        let a_row_signed: isize =
+                                            (row * strides[0] + kh * dilations[0]) as isize
+                                                - pads[0] as isize;
+
+                                        if a_row_signed as usize >= a_shape[MAX_RANK - 2] {
+                                            continue;
+                                        }
+
+                                        let a_row_offset = a_channel_offset
+                                            + (a_row_signed as usize) * a_strides[MAX_RANK - 2];
+
+                                        for inner_col in 0..TILE_SIZE_W {
+                                            let col = col_start + inner_col;
+                                            let a_col_signed: isize =
+                                                (col * strides[1] + kw * dilations[1]) as isize
+                                                    - pads[1] as isize;
+
+                                            if a_col_signed as usize >= a_shape[MAX_RANK - 1] {
+                                                continue;
+                                            }
+
+                                            output[row_offset
+                                                + col * output_strides[MAX_RANK - 1]] += a
+                                                [a_row_offset
+                                                    + (a_col_signed as usize)
+                                                        * a_strides[MAX_RANK - 1]]
+                                                * kernel_val;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        naive_conv(
+            a,
+            a_shape,
+            a_strides,
+            kernel,
+            kernel_shape,
+            kernel_strides,
+            dilations,
+            pads,
+            strides,
+            input_batch_offset,
+            batch_offset,
+            (channels - channels % TILE_SIZE_C)..channels,
+            0..height,
+            0..width,
+            output,
+            output_shape,
+            output_strides,
+        );
+
+        naive_conv(
+            a,
+            a_shape,
+            a_strides,
+            kernel,
+            kernel_shape,
+            kernel_strides,
+            dilations,
+            pads,
+            strides,
+            input_batch_offset,
+            batch_offset,
+            0..(channels - channels % TILE_SIZE_C),
+            height - height % TILE_SIZE_H..height,
+            0..width,
+            output,
+            output_shape,
+            output_strides,
+        );
+
+        naive_conv(
+            a,
+            a_shape,
+            a_strides,
+            kernel,
+            kernel_shape,
+            kernel_strides,
+            dilations,
+            pads,
+            strides,
+            input_batch_offset,
+            batch_offset,
+            0..(channels - channels % TILE_SIZE_C),
+            0..(height - height % TILE_SIZE_H),
+            (width - width % TILE_SIZE_W)..width,
+            output,
+            output_shape,
+            output_strides,
+        );
+    }
+}
+
 pub fn relu(a: &[f32], a_shape: TensorShape, _a_strides: [usize; MAX_RANK], output: &mut [f32]) {
     let lanes = std::simd::f32x64::LEN;
     let chunks: usize = a_shape.iter().product::<usize>() / lanes;
@@ -552,78 +791,30 @@ impl Execute for Op {
                     todo!();
                 }
 
-                let input = retr_tensor!(model, inputs[0]);
-                let input_data: &[f32] = input.data_unchecked();
-                let input_strides = input.strides();
-                let input_shape = input.shape();
-
+                let a = retr_tensor!(model, inputs[0]);
                 let kernel = retr_tensor!(model, inputs[1]);
-                let kernel_data: &[f32] = kernel.data_unchecked();
-                let kernel_strides = kernel.strides();
-                let kernel_shape = kernel.shape();
 
                 let mut output = retr_tensor!(model, outputs[0]);
-                let out_strides = output.strides();
                 let output_shape = output.shape();
+                let output_strides = output.strides();
 
-                let output_data: &mut [f32] = output.data_mut_unchecked();
+                let mut pads = conv_data.pads;
+                conv_data.compute_autopad(&[a.shape(), kernel.shape()], &mut pads);
 
-                let mut out_pads = [0usize; 4];
-                conv_data.compute_autopad(&[input.shape(), kernel.shape()], &mut out_pads);
-
-                // TODO(satvik): Support other dimension convolutions.
-                for n in 0..output_shape[0] {
-                    for out_ch in 0..output_shape[1] {
-                        for out_row in 0..output_shape[2] {
-                            for out_col in 0..output_shape[3] {
-                                let mut sum = 0.0;
-
-                                for in_ch in 0..input_shape[1] {
-                                    for k_row in 0..kernel_shape[2] {
-                                        let input_row: isize = (out_row * conv_data.strides[0]
-                                            + k_row * conv_data.dilations[0])
-                                            as isize
-                                            - out_pads[0] as isize;
-
-                                        if (input_row as usize) >= input_shape[2] {
-                                            continue;
-                                        }
-
-                                        for k_col in 0..kernel_shape[3] {
-                                            let input_col: isize = (out_col * conv_data.strides[1]
-                                                + k_col * conv_data.dilations[1])
-                                                as isize
-                                                - out_pads[1] as isize;
-
-                                            if (input_col as usize) >= input_shape[3] {
-                                                continue;
-                                            }
-
-                                            let in_idx = n * input_strides[0]
-                                                + in_ch * input_strides[1]
-                                                + (input_row as usize) * input_strides[2]
-                                                + (input_col as usize) * input_strides[3];
-
-                                            let k_idx = out_ch * kernel_strides[0]
-                                                + in_ch * kernel_strides[1]
-                                                + k_row * kernel_strides[2]
-                                                + k_col * kernel_strides[3];
-
-                                            sum += input_data[in_idx] * kernel_data[k_idx];
-                                        }
-                                    }
-                                }
-
-                                let out_idx = n * out_strides[0]
-                                    + out_ch * out_strides[1]
-                                    + out_row * out_strides[2]
-                                    + out_col * out_strides[3];
-
-                                output_data[out_idx] = sum;
-                            }
-                        }
-                    }
-                }
+                conv(
+                    a.data_unchecked(),
+                    a.shape(),
+                    a.strides(),
+                    kernel.data_unchecked(),
+                    kernel.shape(),
+                    kernel.strides(),
+                    conv_data.dilations,
+                    pads,
+                    conv_data.strides,
+                    output.data_mut_unchecked(),
+                    output_shape,
+                    output_strides,
+                );
             }
             Op::MaxPool(max_pool_data) => {
                 let input = retr_tensor!(model, inputs[0]);

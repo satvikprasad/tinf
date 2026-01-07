@@ -230,3 +230,25 @@ impl<'a> Tensor<'a> {
         self.get_type().elem_size()
     }
 }
+
+impl From<&Tensor<'_>> for Vec<u8> {
+    fn from(value: &Tensor) -> Self {
+        match value {
+            Tensor::F32(tensor_data) => tensor_data
+                .data
+                .iter()
+                .flat_map(|f| f.to_ne_bytes())
+                .collect(),
+            Tensor::F64(tensor_data) => tensor_data
+                .data
+                .iter()
+                .flat_map(|f| f.to_ne_bytes())
+                .collect(),
+            Tensor::I64(tensor_data) => tensor_data
+                .data
+                .iter()
+                .flat_map(|i| i.to_ne_bytes())
+                .collect(),
+        }
+    }
+}

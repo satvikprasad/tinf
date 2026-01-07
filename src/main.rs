@@ -10,7 +10,7 @@ mod tensor;
 fn main() {
     let mut model = onnx::parse("models/mnist-12.onnx").unwrap();
     let start = std::time::Instant::now();
-    let iterations = 10000;
+    let iterations = 1000;
 
     for _ in 0..iterations {
         model.execute();
