@@ -9,3 +9,18 @@ Tinf currently supports the following elementary tensor ops:
 - **ReLU**: Rectified linear unit activation
 - **MaxPool**: 2D max pooling with configurable kernel size, stride, padding, and dilation
 - **Reshape**: Tensor reshaping to specified dimensions
+
+## Benchmarks
+|Model|Input Shape|Tinf (ms / inference)|
+|MNIST MLP| [1, 784] | 0.73 |
+
+*Benchmarks run on Apple M4, singlethreaded.*
+
+## Roadmap
+- [ ] BatchNormalization (with folding into Conv)
+- [ ] GlobalAveragePool
+- [ ] Sigmoid, Tanh, Softmax activations
+- [ ] Concat, Split, Transpose
+- [ ] Multi-threaded inference
+- [ ] SIMD vectorization
+- [ ] INT8 quantization support
