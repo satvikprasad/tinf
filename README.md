@@ -11,8 +11,9 @@ Tinf currently supports the following elementary tensor ops:
 - **Reshape**: Tensor reshaping to specified dimensions
 
 ## Benchmarks
-|Model|Input Shape|Tinf (ms / inference)|
-|MNIST MLP| [1, 784] | 0.73 |
+| Model | Input Shape | Tinf (ms / inference) |
+| ----- | --- | --- |
+| MNIST MLP | [1, 784] | 0.73 |
 
 *Benchmarks run on Apple M4, singlethreaded.*
 
